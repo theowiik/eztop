@@ -6,6 +6,10 @@ Run it anywhere, no install:
 
     curl -fsSL https://raw.githubusercontent.com/theowiik/eztop/main/eztop | python3 -
 
+With Nix:
+
+    nix run github:theowiik/eztop
+
 Or from a checkout:
 
     ./eztop          # q to quit
