@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""eztop: system monitor that only shows what matters."""
+import argparse
+import curses
+import os
+import pwd
+import shutil
+import sys
+import time
+from collections import defaultdict, deque
+
+TICK = os.sysconf("SC_CLK_TCK")
+PAGE = os.sysconf("SC_PAGE_SIZE")
+TOP_N = 5
+# Green through yellow to red.
+RAMP_256 = [46, 82, 118, 154, 190, 226, 220, 214, 208, 202, 196]
+RAMP_8 = [curses.COLOR_GREEN, curses.COLOR_YELLOW, curses.COLOR_RED]
+
+
+def read_cpu():
+    fields = list(map(int, open("/proc/stat").readline().split()[1:9]))
+    idle = fields[3] + fields[4]
+    return sum(fields), idle
+
+
+def read_mem():
+    info = {}
+    for line in open("/proc/meminfo"):
+        key, value = line.split(":")
+        info[key] = int(value.split()[0]) * 1024
+    return info["MemTotal"] - info["MemAvailable"], info["MemTotal"]
+
+
+def read_cores():
+    """Per-core (total, idle) tick counters."""
+    cores = []
+    for line in open("/proc/stat"):
+        if line.startswith("cpu") and line[3].isdigit():
+            fields = list(map(int, line.split()[1:9]))
+            cores.append((sum(fields), fields[3] + fields[4]))
+    return cores
+
+
+def read_procs():
+    """Map pid -> (name, cpu ticks, resident bytes, uid)."""
+    procs = {}
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                stat = f.read()
+            uid = os.stat(f"/proc/{pid}").st_uid
+        except OSError:
+            continue  # process exited while we were looking
+        name = stat[stat.index("(") + 1 : stat.rindex(")")]
+        rest = stat[stat.rindex(")") + 2 :].split()
+        procs[pid] = (name, int(rest[11]) + int(rest[12]), int(rest[21]) * PAGE, uid)
+    return procs
+
+
+class Sampler:
+    def __init__(self):
+        self.cpu = read_cpu()
+        self.cores = read_cores()
+        self.procs = read_procs()
+        self.at = time.monotonic()
+
+    def sample(self):
+        cpu, cores, procs, at = read_cpu(), read_cores(), read_procs(), time.monotonic()
+        total = cpu[0] - self.cpu[0]
+        busy = total - (cpu[1] - self.cpu[1])
+        elapsed = at - self.at
+        rows = []
+        apps = defaultdict(lambda: [0, 0])
+        for pid, (name, ticks, rss, uid) in procs.items():
+            before = self.procs[pid][1] if pid in self.procs else ticks
+            pct = (ticks - before) / TICK / elapsed * 100
+            rows.append((pct, rss, name, pid, uid))
+            apps[name][0] += pct
+            apps[name][1] += rss
+        grouped = [(pct, rss, name) for name, (pct, rss) in apps.items()]
+        core_pcts = []
+        for (t1, i1), (t0, i0) in zip(cores, self.cores):
+            core_pcts.append(100 * ((t1 - t0) - (i1 - i0)) / (t1 - t0) if t1 > t0 else 0)
+        self.cpu, self.cores, self.procs, self.at = cpu, cores, procs, at
+        return {
+            "cpu": 100 * busy / total if total else 0,
+            "cores": core_pcts,
+            "mem": read_mem(),
+            "disk": shutil.disk_usage("/"),
+            "by_cpu": sorted(grouped, reverse=True)[:TOP_N],
+            "by_mem": sorted(grouped, key=lambda r: r[1], reverse=True)[:TOP_N],
+            "procs": rows,
+        }
+
+
+def gib(n):
+    return f"{n / 2**30:.1f}G"
+
+
+def bar(pct, width=24):
+    """Cells keep their position's color, so a fuller bar reaches further into red."""
+    filled = round(min(pct, 100) / 100 * width)
+    cells = [("█", (i + 0.5) / width * 100) for i in range(filled)]
+    return cells + [("░" * (width - filled), "dim")]
+
+
+def sparkline(history, width=24):
+    recent = list(history)[-width:]
+    blocks = "▁▂▃▄▅▆▇█"
+    cells = [(blocks[min(int(p / 100 * 8), 7)], p) for p in recent]
+    return [(" " * (width - len(recent)), None)] + cells
+
+
+def uptime():
+    minutes = int(float(open("/proc/uptime").read().split()[0]) // 60)
+    days, hours, mins = minutes // 1440, minutes // 60 % 24, minutes % 60
+    return f"{days}d {hours}h" if days else f"{hours}h {mins}m"
+
+
+def meter(label, pct, detail=""):
+    return [(f" {label:<5}", "bold")] + bar(pct) + [(f" {pct:3.0f}%", pct), (f"  {detail}", "dim")]
+
+
+def proc_row(name, pct, value):
+    return [(f"   {name[:18]:<18} ", None)] + bar(pct, 10) + [(f" {value:>6}", pct)]
+
+
+def title_line():
+    host = os.uname().nodename
+    return [(" eztop", "title"), (f"  {host} · up {uptime()} · {time.strftime('%H:%M')}", "dim")]
+
+
+def user_name(uid):
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)  # unmapped, e.g. inside a container
+
+
+def command(pid, name):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            parts = f.read().split(b"\0")
+    except OSError:
+        return name
+    return " ".join(p.decode(errors="replace") for p in parts if p) or name
+
+
+def render_advanced(s, sort, rows):
+    used, total = s["mem"]
+    disk = s["disk"]
+    blocks = "▁▂▃▄▅▆▇█"
+    load = "  ".join(f"{n:.2f}" for n in os.getloadavg())
+    lines = [
+        title_line(),
+        [],
+        meter("CPU", s["cpu"]),
+        [(f" {'CORES':<5}", "bold")] + [(blocks[min(int(p / 100 * 8), 7)], p) for p in s["cores"]],
+        meter("RAM", 100 * used / total, f"{gib(used)} / {gib(total)}"),
+        meter("DISK", 100 * disk.used / disk.total, f"{gib(disk.used)} / {gib(disk.total)}"),
+        [(f" {'LOAD':<5}", "bold"), (load, None), (f"   {len(s['procs'])} tasks", "dim")],
+        [],
+        [(f" {'PID':>7} {'USER':<9} {'CPU':>5} {'MEM':>6}  COMMAND", "bold")],
+    ]
+    field = 0 if sort == "cpu" else 1
+    for cpu, rss, name, pid, uid in sorted(s["procs"], key=lambda r: r[field], reverse=True)[:rows]:
+        lines.append([
+            (f" {pid:>7} {user_name(uid)[:9]:<9} ", None),
+            (f"{cpu:4.0f}%", cpu),
+            (f" {gib(rss):>6}", 100 * rss / total),
+            (f"  {command(pid, name)[:44]}", "dim"),
+        ])
+    return lines
+
+
+def buttons(advanced_on, sort):
+    """(label, key, active) for the bottom bar."""
+    if not advanced_on:
+        return [(" a advanced ", "a", False), (" q quit ", "q", False)]
+    return [
+        (" a simple ", "a", False),
+        (" c cpu ", "c", sort == "cpu"),
+        (" m memory ", "m", sort == "mem"),
+        (" q quit ", "q", False),
+    ]
+
+
+def render(s, history):
+    used, total = s["mem"]
+    disk = s["disk"]
+    mem_pct = 100 * used / total
+    disk_pct = 100 * disk.used / disk.total
+    lines = [
+        title_line(),
+        [],
+        meter("CPU", s["cpu"]),
+        [(" " * 6, None)] + sparkline(history),
+        meter("RAM", mem_pct, f"{gib(used)} / {gib(total)}"),
+        meter("DISK", disk_pct, f"{gib(disk.used)} / {gib(disk.total)}"),
+        [],
+        [(" Busiest", "bold")],
+    ]
+    busy = [r for r in s["by_cpu"] if r[0] >= 0.5]
+    lines += [proc_row(name, cpu, f"{cpu:.0f}%") for cpu, _, name in busy]
+    if not busy:
+        lines.append([("   all quiet", "dim")])
+    lines += [[], [(" Most memory", "bold")]]
+    lines += [proc_row(name, 100 * rss / total, gib(rss)) for _, rss, name in s["by_mem"]]
+    return lines
+
+
+def plain(line):
+    return "".join(text for text, _ in line)
+
+
+def init_colors():
+    if not curses.has_colors():
+        return 0
+    curses.use_default_colors()
+    ramp = RAMP_256 if curses.COLORS >= 256 else RAMP_8
+    for i, color in enumerate(ramp, 1):
+        curses.init_pair(i, color, -1)
+    curses.init_pair(len(ramp) + 1, curses.COLOR_CYAN, -1)
+    return len(ramp)
+
+
+def attr(style, steps):
+    if style is None:
+        return 0
+    if style == "dim":
+        return curses.A_DIM
+    if style == "bold":
+        return curses.A_BOLD
+    if style == "button":
+        return curses.A_REVERSE
+    if style == "active":
+        return curses.A_REVERSE | curses.A_BOLD
+    if not steps:
+        return curses.A_BOLD if style == "title" else 0
+    if style == "title":
+        return curses.color_pair(steps + 1) | curses.A_BOLD
+    return curses.color_pair(1 + round(min(style, 100) / 100 * (steps - 1)))
+
+
+def draw_buttons(stdscr, y, width, labels):
+    """Draw the button bar and return click zones as (start, end, key)."""
+    total = sum(len(label) + 2 for label, _, _ in labels) - 2
+    x = max(0, (width - total) // 2)
+    zones = []
+    for label, key, active in labels:
+        if x + len(label) >= width:
+            break
+        stdscr.addstr(y, x, label, attr("active" if active else "button", 0))
+        zones.append((x, x + len(label), ord(key)))
+        x += len(label) + 2
+    return zones
+
+
+def tui(stdscr, sampler, interval):
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass  # terminal cannot hide the cursor
+    steps = init_colors()
+    curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)
+    curses.mouseinterval(0)
+    stdscr.timeout(int(interval * 1000))
+    history = deque(maxlen=120)
+    advanced_on = False
+    sort = "cpu"
+    s = None
+    key = -1
+    while True:
+        if s is None or key == -1:  # keys redraw at once without skewing the sample
+            s = sampler.sample()
+            history.append(s["cpu"])
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        if advanced_on:
+            lines = render_advanced(s, sort, max(0, height - 11))
+        else:
+            lines = render(s, history)
+        left = max(0, (width - max(len(plain(line)) for line in lines)) // 2)
+        top = max(0, (height - 1 - len(lines)) // 2)
+        for y, line in enumerate(lines[: height - top - 1], top):
+            x = left
+            for text, style in line:
+                if x < width - 1:
+                    stdscr.addnstr(y, x, text, width - 1 - x, attr(style, steps))
+                x += len(text)
+        zones = draw_buttons(stdscr, height - 1, width, buttons(advanced_on, sort))
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, _ = curses.getmouse()
+            except curses.error:
+                continue
+            hit = [k for start, end, k in zones if my == height - 1 and start <= mx < end]
+            if not hit:
+                continue
+            key = hit[0]
+        if key in (ord("q"), 27):
+            return
+        if key == ord("a"):
+            advanced_on = not advanced_on
+        elif key == ord("c"):
+            sort = "cpu"
+        elif key == ord("m"):
+            sort = "mem"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-n", "--interval", type=float, default=2, help="seconds between updates")
+    parser.add_argument("--once", action="store_true", help="print one snapshot and exit")
+    args = parser.parse_args()
+    sampler = Sampler()
+    if args.once:
+        time.sleep(1)
+        s = sampler.sample()
+        print("\n".join(plain(line) for line in render(s, [s["cpu"]])))
+        return
+    if not sys.stdin.isatty():  # piped from curl: keys still come from the terminal
+        os.dup2(os.open("/dev/tty", os.O_RDONLY), 0)
+    time.sleep(0.2)
+    try:
+        curses.wrapper(tui, sampler, args.interval)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
